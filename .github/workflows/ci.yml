@@ -109,7 +109,7 @@ jobs:
           repository: victorcondackdev/iso20022-pix-go
           path: iso20022-pix-go
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: iso20022-pix-go/go.mod
 
