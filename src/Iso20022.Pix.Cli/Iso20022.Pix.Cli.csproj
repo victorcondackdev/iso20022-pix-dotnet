@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Iso20022.Pix.Cli</RootNamespace>
+    <AssemblyName>iso20022</AssemblyName>
+    <!-- The command-line tool has no public API to document. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup Label="NuGet">
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>iso20022</ToolCommandName>
+    <PackageId>Iso20022.Pix.Cli</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Victor Condack</Authors>
+    <Description>Command-line tool to inspect and validate Pix ISO 20022 messages and to build pacs.004 returns.</Description>
+    <PackageTags>iso20022;pix;spi;cli</PackageTags>
+    <RepositoryUrl>https://github.com/victorcondackdev/iso20022-pix-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 Victor Condack</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Iso20022.Pix.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Iso20022.Pix/Iso20022.Pix.csproj" />
+  </ItemGroup>
+
+</Project>

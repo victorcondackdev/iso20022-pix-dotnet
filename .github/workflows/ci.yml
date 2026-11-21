@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    name: Build, test and pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: SDK info
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore Iso20022.Pix.sln
+
+      - name: Build (warnings are errors)
+        run: dotnet build Iso20022.Pix.sln -c Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test tests/Iso20022.Pix.Tests/Iso20022.Pix.Tests.csproj -c Release --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory TestResults
+          --logger "trx;LogFileName=results.trx"
+          --logger "console;verbosity=normal"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          if-no-files-found: ignore
+
+      - name: Pack
+        run: |
+          dotnet pack src/Iso20022.Pix/Iso20022.Pix.csproj -c Release --no-build -o artifacts
+          dotnet pack src/Iso20022.Pix.Cli/Iso20022.Pix.Cli.csproj -c Release --no-build -o artifacts
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          path: artifacts/*nupkg
+          if-no-files-found: error
+
+      - name: Check formatting
+        continue-on-error: true
+        run: dotnet format Iso20022.Pix.sln --verify-no-changes --no-restore --verbosity diagnostic
+
+  trimming:
+    name: Trimming smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # IsAotCompatible enables the trim, AOT and single-file analyzers during the
+      # normal build; publishing a trimmed console app that references the library
+      # additionally proves there are no ILLink warnings at the consumer side.
+      - name: Publish trimmed consumer
+        run: |
+          mkdir -p /tmp/aotcheck && cd /tmp/aotcheck
+          dotnet new console --force -o . -n AotCheck
+          dotnet add reference "$GITHUB_WORKSPACE/src/Iso20022.Pix/Iso20022.Pix.csproj"
+          cp "$GITHUB_WORKSPACE/testdata/pacs008.xml" .
+          cat > Program.cs <<'CS'
+          string xml = System.IO.File.ReadAllText(args.Length > 0 ? args[0] : "pacs008.xml");
+          var type = Iso20022.Pix.MessageDetector.Detect(xml);
+          var doc = Iso20022.Pix.Pacs008Document.Parse(xml);
+          System.Console.WriteLine(type + " " + doc.Validate().Count + " " + (doc.ToXml() == xml));
+          CS
+          dotnet publish -c Release -r linux-x64 --self-contained -p:PublishTrimmed=true -p:TreatWarningsAsErrors=true -o out
+          ./out/AotCheck pacs008.xml
+
+  parity:
+    name: Regenerate Go parity vectors
+    runs-on: ubuntu-latest
+    # Requires the Go implementation to be reachable; informative until it is public.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: iso20022-pix-dotnet
+
+      - uses: actions/checkout@v4
+        with:
+          repository: victorcondackdev/iso20022-pix-go
+          path: iso20022-pix-go
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: iso20022-pix-go/go.mod
+
+      - name: Vectors are up to date
+        working-directory: iso20022-pix-dotnet
+        run: |
+          go -C tools/vecgen run . > tests/Iso20022.Pix.Tests/Parity/GoVectors.g.cs
+          git diff --exit-code -- tests/Iso20022.Pix.Tests/Parity/GoVectors.g.cs

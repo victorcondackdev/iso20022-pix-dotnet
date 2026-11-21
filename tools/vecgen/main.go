@@ -1,0 +1,1258 @@
+// Command vecgen generates the cross-language parity vectors used by the C#
+// test suite. It runs the Go implementation
+// (github.com/victorcondackdev/iso20022-pix-go) over a deterministic corpus
+// and writes the observed outputs as C# literals.
+//
+// Usage, from the repository root, with the Go module cloned next to it:
+//
+//	go -C tools/vecgen run . > tests/Iso20022.Pix.Tests/Parity/GoVectors.g.cs
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+
+	iso20022 "github.com/victorcondackdev/iso20022-pix-go"
+	"github.com/victorcondackdev/iso20022-pix-go/camt054"
+	"github.com/victorcondackdev/iso20022-pix-go/ids"
+	"github.com/victorcondackdev/iso20022-pix-go/money"
+	"github.com/victorcondackdev/iso20022-pix-go/pacs002"
+	"github.com/victorcondackdev/iso20022-pix-go/pacs004"
+	"github.com/victorcondackdev/iso20022-pix-go/pacs008"
+	"github.com/victorcondackdev/iso20022-pix-go/xsd"
+)
+
+const testdata = "../../testdata/"
+
+var rng = rand.New(rand.NewSource(20261121))
+
+// lit renders s as a C# string literal. Non-ASCII and control characters
+// are written as \u escapes so that the generated file is pure ASCII.
+func lit(s string) string {
+	if !utf8.ValidString(s) {
+		panic(fmt.Sprintf("invalid UTF-8 in vector: %q", s))
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r >= 0x20 && r < 0x7F:
+			b.WriteRune(r)
+		default:
+			for _, u := range utf16.Encode([]rune{r}) {
+				fmt.Fprintf(&b, `\u%04X`, u)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func boolLit(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+type writer struct{ b bytes.Buffer }
+
+func (w *writer) f(format string, args ...any) { fmt.Fprintf(&w.b, format, args...) }
+
+func (w *writer) table(name, tupleType string, rows [][]string) {
+	w.f("\n    public static readonly %s[] %s =\n    {\n", tupleType, name)
+	for _, r := range rows {
+		w.f("        (%s),\n", strings.Join(r, ", "))
+	}
+	w.f("    };\n")
+}
+
+func load(name string) string {
+	b, err := os.ReadFile(testdata + name)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func sha(b []byte) string { return fmt.Sprintf("%X", sha256.Sum256(b)) }
+
+func uniq(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] && utf8.ValidString(s) {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// mutationRunes are substituted or inserted into identifiers, amounts and
+// dates. They include multi-byte characters so that byte-versus-character
+// semantics are covered.
+var mutationRunes = []rune("0123456789AZaz.,-+:/ TZ@_'\"\\\tã€１🙂")
+
+func mutate(s string) string {
+	r := []rune(s)
+	pick := func() rune { return mutationRunes[rng.Intn(len(mutationRunes))] }
+	if len(r) == 0 {
+		return string(pick())
+	}
+	i := rng.Intn(len(r))
+	switch rng.Intn(3) {
+	case 0:
+		r[i] = pick()
+	case 1:
+		r = append(r[:i], append([]rune{pick()}, r[i:]...)...)
+	default:
+		r = append(r[:i], r[i+1:]...)
+	}
+	return string(r)
+}
+
+func mutations(seeds []string, n int) []string {
+	var out []string
+	for i := 0; i < n; i++ {
+		s := seeds[rng.Intn(len(seeds))]
+		for k := 0; k <= rng.Intn(2); k++ {
+			s = mutate(s)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// errKind classifies a parse error with the names of the C#
+// MessageParseErrorKind enumeration. Except for Malformed, whose detail
+// comes from the XML parser, the message is part of the expected result.
+func errKind(err error) string {
+	var ne *strconv.NumError
+	switch {
+	case errors.Is(err, iso20022.ErrNoDocument):
+		return "NoDocument:" + err.Error()
+	case errors.Is(err, iso20022.ErrUnknownNamespace):
+		return "UnknownNamespace:" + err.Error()
+	case errors.Is(err, iso20022.ErrUnexpectedMessage):
+		return "UnexpectedMessage:" + err.Error()
+	case errors.Is(err, iso20022.ErrDirectiveForbidden):
+		return "DirectiveForbidden:" + err.Error()
+	case errors.Is(err, iso20022.ErrMultipleDocuments):
+		return "MultipleDocuments:" + err.Error()
+	case errors.Is(err, money.ErrInvalidAmount):
+		return "InvalidAmount:" + err.Error()
+	case strings.Contains(err.Error(), "more than one AppHdr"):
+		return "MultipleHeaders:" + err.Error()
+	case errors.As(err, &ne):
+		return "InvalidBoolean:" + err.Error()
+	}
+	if os.Getenv("VECGEN_DEBUG") != "" {
+		fmt.Fprintln(os.Stderr, "malformed:", err)
+	}
+	return "Malformed"
+}
+
+func violations(err error) string {
+	if err == nil {
+		return ""
+	}
+	var vs xsd.Violations
+	if !errors.As(err, &vs) {
+		panic(fmt.Sprintf("not violations: %v", err))
+	}
+	lines := make([]string, len(vs))
+	for i, v := range vs {
+		lines[i] = v.Error()
+	}
+	return strings.Join(lines, "\n")
+}
+
+func main() {
+	w := &writer{}
+	w.f("// <auto-generated>\n")
+	w.f("// Generated by tools/vecgen from the Go implementation (github.com/victorcondackdev/iso20022-pix-go).\n")
+	w.f("// Do not edit by hand; regenerate with: go -C tools/vecgen run . > tests/Iso20022.Pix.Tests/Parity/GoVectors.g.cs\n")
+	w.f("// </auto-generated>\n\n")
+	w.f("namespace Iso20022.Pix.Tests.Parity;\n\n")
+	w.f("internal static class GoVectors\n{")
+
+	genAmounts(w)
+	genAmountFormat(w)
+	genDateTimes(w)
+	genIDs(w)
+	genGenerated(w)
+	genKeys(w)
+	genTaxIDs(w)
+	genMsgIDs(w)
+	genDetect(w)
+	genDocuments(w)
+	genModels(w)
+	genBuilders(w)
+
+	w.f("}\n")
+	if _, err := os.Stdout.Write(w.b.Bytes()); err != nil {
+		panic(err)
+	}
+}
+
+// ---------------------------------------------------------------- money
+
+func genAmounts(w *writer) {
+	inputs := []string{
+		"0", "0.0", "0.00", "0.01", "0.1", "1", "10.5", "10.50", "010.50", "1234567.89",
+		"9999999999999999.99", "0000000000000000.01",
+		"", ".", ".5", "1.", "1.234", "-1", "+1", "1e2", "1E2", " 1", "1 ", "1,00", "1.0.0", "1_000",
+		"0x10", "NaN", "Inf", "１", "ã", "'", "\x00", "1234567890123456789", "12345678901234567.890",
+		"99999999999999999.9", "999999999999999999", "10000000000000000", "92233720368547758.07",
+	}
+	inputs = append(inputs, mutations([]string{"0", "0.01", "10.5", "150.75", "9999999999999999.99", "1.234", "00000000000000001.1"}, 60)...)
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		a, err := money.Parse(s)
+		res := "ok:" + strconv.FormatInt(int64(a), 10)
+		if err != nil {
+			res = "err:" + err.Error()
+		}
+		rows = append(rows, []string{lit(s), lit(res)})
+	}
+	w.table("Amounts", "(string Input, string Result)", rows)
+}
+
+func genAmountFormat(w *writer) {
+	cents := []int64{0, 1, 10, 100, 1050, -1, -1050, 15075, math.MaxInt64, math.MinInt64,
+		int64(money.MaxAmount), int64(money.MaxAmount) + 1, -int64(money.MaxAmount)}
+	for i := 0; i < 20; i++ {
+		cents = append(cents, rng.Int63n(1<<uint(rng.Intn(62)+1))-rng.Int63n(1000))
+	}
+	var rows [][]string
+	for _, c := range cents {
+		a := money.Amount(c)
+		text, err := a.MarshalText()
+		iso := string(text)
+		if err != nil {
+			iso = "err:" + err.Error()
+		}
+		rows = append(rows, []string{strconv.FormatInt(c, 10) + "L", lit(a.String()), lit(iso)})
+	}
+	// long.MinValue cannot be written as a literal with a minus sign applied to it.
+	for _, r := range rows {
+		if r[0] == "-9223372036854775808L" {
+			r[0] = "long.MinValue"
+		}
+	}
+	w.table("AmountFormats", "(long Cents, string Text, string Iso)", rows)
+}
+
+// ---------------------------------------------------------------- dates
+
+func genDateTimes(w *writer) {
+	inputs := []string{
+		"2026-11-21T10:30:00.500Z", "2026-11-21T10:30:00Z", "2026-11-21T07:30:00-03:00", "2026-11-21T10:30:00",
+		"2026-11-21T10:30:00.123456", "", "2026-11-21", "2026-13-01T00:00:00Z", "21/11/2026 10:30",
+		"2026-02-30", "2024-02-29", "2023-02-29", "2000-02-29", "1900-02-29", "0000-02-29", "0000-01-01T00:00:00Z",
+		"2026-11-21T1:30:00Z", "2026-11-21T10:30:00,5Z", "2026-11-21T10:30:00.Z", "2026-11-21T10:30:00.1234567891234Z",
+		"2026-11-21T10:30:00+24:00", "2026-11-21T10:30:00+24:60", "2026-11-21T10:30:00+25:00", "2026-11-21T10:30:00+23:61",
+		"2026-11-21T10:30:00z", "2026-11-21T24:00:00Z", "2026-11-21T23:60:00Z", "2026-11-21T23:59:60Z",
+		"2026-11-21T10:30:00+0300", "2026-11-21T10:30:00 +03:00", "2026-11-21t10:30:00Z", "2026-1-21T10:30:00Z",
+		"2026-11-1T10:30:00Z", "26-11-21T10:30:00Z", "2026-11-21T10:3:00Z", "2026-11-21T10:30:0Z", "2026-11-21T10:30:00Zx",
+		"2026-11-21T10:30", "+026-11-21", "2026-11-21 ", " 2026-11-21", "2026-11-21Z", "2026-04-31", "2026-11-00",
+	}
+	inputs = append(inputs, mutations([]string{"2026-11-21T10:30:00.500Z", "2026-11-21T07:30:00-03:00", "2026-11-21", "2026-11-21T10:30:00"}, 80)...)
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		_, errDT := xsd.DateTime(s).Time()
+		_, errD := xsd.Date(s).Time()
+		rows = append(rows, []string{lit(s), boolLit(errDT == nil), boolLit(errD == nil)})
+	}
+	w.table("DateTimes", "(string Input, bool IsDateTime, bool IsDate)", rows)
+}
+
+// ---------------------------------------------------------------- ids
+
+func idResult(p ids.PixID, err error) string {
+	if err != nil {
+		return "err:" + err.Error()
+	}
+	return "ok:" + p.ISPB + "|" + p.Time.Format("200601021504") + "|" + p.Sequence
+}
+
+func genIDs(w *writer) {
+	const sample = "E9999999920261121103000000000001"
+	inputs := []string{
+		sample, "D9999999920261121103000000000001", "E99999999202611211030a1B2c3D4e5F", "D88888888202611211500Zx9Yw8Vu7Ts",
+		"", "E123", "E99999A9920261121103000000000001", "E999999992026112110X000000000001", "E9999999920261321103000000000001",
+		"E9999999920260230103000000000001", "E99999999202611211030000000000-1", "E9999999920240229235900000000001",
+		"E9999999920230229235900000000001", "E9999999920261121240000000000001", "E9999999920261121236000000000001",
+		"E99999999202611211030a1B2c3D4e5", "E99999999202611211030a1B2c3D4e5Fx", "e99999999202611211030a1B2c3D4e5F",
+		"E99999999202611211030a1B2c3D4ã", "Eã999999202611211030a1B2c3D4e5F", "E99999999202611211030a1B2c3D4eé",
+	}
+	inputs = append(inputs, mutations([]string{sample, "D88888888202611211500Zx9Yw8Vu7Ts", "E99999999202611211030a1B2c3D4e5F"}, 80)...)
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		// Year 0000 is valid in Go but not representable by System.DateTime:
+		// a documented difference, left out of the vectors.
+		if len(s) == 32 && s[9:13] == "0000" {
+			continue
+		}
+		e, errE := ids.ParseEndToEndID(s)
+		d, errD := ids.ParseReturnID(s)
+		rows = append(rows, []string{lit(s), lit(idResult(e, errE)), lit(idResult(d, errD))})
+	}
+	w.table("PixIds", "(string Input, string EndToEnd, string Return)", rows)
+}
+
+// pattern is the deterministic byte stream shared with the C# tests.
+func pattern(seed, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*seed + 7)
+	}
+	return b
+}
+
+func genGenerated(w *writer) {
+	streams := map[string][]byte{
+		"zeros256":   make([]byte, 256),
+		"p37x256":    pattern(37, 256),
+		"p5x64":      pattern(5, 64),
+		"p11x32":     pattern(11, 32),
+		"z61ff":      bytes.Repeat([]byte{0, 61, 255}, 20),
+		"ffx4096":    bytes.Repeat([]byte{255}, 4096),
+		"ffx2047+00": append(bytes.Repeat([]byte{255}, 2047), make([]byte, 64)...),
+		"short10":    pattern(3, 10),
+		"empty":      {},
+		"x32ff":      append(bytes.Repeat([]byte{250}, 31), 1),
+	}
+	names := []string{"zeros256", "p37x256", "p5x64", "p11x32", "z61ff", "ffx4096", "ffx2047+00", "short10", "empty", "x32ff"}
+	ispbs := []string{"99999999", "12345678", "1234", "x", "1234567a", "ã2345678"}
+	unixes := []int64{1795000000, 0, -62135596800, 253402300799, 1763721059}
+	var rows [][]string
+	for _, kind := range []string{"E", "D", "M"} {
+		for _, name := range names {
+			ispb := ispbs[rng.Intn(len(ispbs))]
+			if rng.Intn(2) == 0 {
+				ispb = "99999999"
+			}
+			unix := unixes[rng.Intn(len(unixes))]
+			at := time.Unix(unix, 0)
+			rnd := bytes.NewReader(streams[name])
+			var s string
+			var err error
+			switch kind {
+			case "E":
+				s, err = ids.NewEndToEndID(ispb, at, rnd)
+			case "D":
+				s, err = ids.NewReturnID(ispb, at, rnd)
+			default:
+				s, err = ids.NewMsgID(ispb, rnd)
+			}
+			res := s
+			if err != nil {
+				res = "err:" + err.Error()
+			}
+			rows = append(rows, []string{lit(kind), lit(ispb), strconv.FormatInt(unix, 10) + "L", lit(name), lit(res)})
+		}
+	}
+	w.table("GeneratedIds", "(string Kind, string Ispb, long Unix, string Stream, string Result)", rows)
+}
+
+func genKeys(w *writer) {
+	inputs := []string{
+		"52998224725", "11222333000181", "12ABC34501DE35", "fulano@example.com", "+5521987654321",
+		"123e4567-e89b-12d3-a456-426614174000", "", "Fulano@example.com", "fulano@", "@example.com", "a@b@c.com",
+		"a@nodot", "a@.com", "a@b.", "a b@example.com", strings.Repeat("a", 70) + "@example.com",
+		strings.Repeat("a", 65) + "@example.com", "+0123", "+", "+1", "+12", "+55 21 98765-4321", "+1234567890123456",
+		"+123456789012345", "123E4567-E89B-12D3-A456-426614174000", "123e4567-e89b-12d3-a456_426614174000",
+		"52998224724", "529.982.247-25", "21987654321x", "ãbc@example.com", "abc@exãmple.com",
+		"123e4567-e89b-12d3-a456-4266141740ã", "123e4567-e89b-12d3-a456-42661417400", "11111111111",
+		"00000000000000", "12abc34501de35", "+5521987654321ã",
+	}
+	inputs = append(inputs, mutations([]string{"fulano@example.com", "+5521987654321", "123e4567-e89b-12d3-a456-426614174000", "52998224725", "11222333000181"}, 70)...)
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		k, err := ids.ClassifyPixKey(s)
+		res := k.String()
+		if err != nil {
+			res = "err:" + err.Error()
+		}
+		rows = append(rows, []string{lit(s), lit(res)})
+	}
+	w.table("PixKeys", "(string Input, string Result)", rows)
+}
+
+func digits(n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		b.WriteByte(byte('0' + rng.Intn(10)))
+	}
+	return b.String()
+}
+
+func genTaxIDs(w *writer) {
+	inputs := []string{
+		"52998224725", "11144477735", "11222333000181", "12ABC34501DE35", "52998224724", "11111111111", "5299822472",
+		"5299822472a", "529.982.247-25", "11222333000182", "00000000000000", "12abc34501de35", "12ABC34501DEA5",
+		"1122233300018", "11.222.333/0001-81", "", "00000000", "0000000", "0000000a", "9999999ã", "AAAAAAAAAAAAAA",
+	}
+	for i := 0; i < 15; i++ {
+		base := digits(9)
+		for s := 0; s < 100; s++ {
+			c := base + fmt.Sprintf("%02d", s)
+			if ids.ValidCPF(c) {
+				inputs = append(inputs, c)
+				break
+			}
+		}
+		const a = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		var b strings.Builder
+		for k := 0; k < 12; k++ {
+			b.WriteByte(a[rng.Intn(len(a))])
+		}
+		for s := 0; s < 100; s++ {
+			c := b.String() + fmt.Sprintf("%02d", s)
+			if ids.ValidCNPJ(c) {
+				inputs = append(inputs, c)
+				break
+			}
+		}
+	}
+	inputs = append(inputs, mutations([]string{"52998224725", "11222333000181", "12ABC34501DE35"}, 40)...)
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		rows = append(rows, []string{lit(s), boolLit(ids.ValidCPF(s)), boolLit(ids.ValidCNPJ(s)), boolLit(ids.ValidISPB(s))})
+	}
+	w.table("TaxIds", "(string Input, bool Cpf, bool Cnpj, bool Ispb)", rows)
+}
+
+func genMsgIDs(w *writer) {
+	inputs := []string{
+		"", " ", "\t\n\r ", "M9999999920261121103000000000001", strings.Repeat("x", 35), strings.Repeat("x", 36),
+		strings.Repeat("ã", 35), strings.Repeat("ã", 36), strings.Repeat("🙂", 35), strings.Repeat("🙂", 36), "\u00a0", "a b",
+	}
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		res := ""
+		if err := ids.ValidateMsgID(s); err != nil {
+			res = err.Error()
+		}
+		rows = append(rows, []string{lit(s), lit(res)})
+	}
+	w.table("MsgIds", "(string Input, string Error)", rows)
+}
+
+// ---------------------------------------------------------------- detection
+
+func headerString(h *iso20022.AppHdr) string {
+	if h == nil {
+		return "nohdr"
+	}
+	return strings.Join([]string{h.XMLName.Space, h.Fr.ISPB(), h.To.ISPB(), h.BizMsgIdr, h.MsgDefIdr, h.BizSvc, string(h.CreDt)}, "|")
+}
+
+func genDetect(w *writer) {
+	envelope := load("envelope_pacs008.xml")
+	ns := "urn:iso:std:iso:20022:tech:xsd:"
+	inputs := []string{
+		load("pacs008.xml"), envelope, load("pacs002_accept.xml"), load("pacs002_reject.xml"), load("pacs004.xml"), load("camt054.xml"),
+		`<Document xmlns="` + ns + `pacs.008.001.13"/>`,
+		`<ns:Document xmlns:ns="` + ns + `pacs.008.001.02"><ns:FIToFICstmrCdtTrf/></ns:Document>`,
+		`<Document xmlns="` + ns + `camt.053.001.08"/>`,
+		``, `   `, `<!-- only a comment -->`, `<?xml version="1.0"?>`, `<a><b/></a>`, `<Document/>`,
+		`<Document xmlns="` + ns + `pacs.008"/>`, `<Document xmlns="urn:x:pacs.008.001.08"/>`,
+		`<Document xmlns="` + ns + `PACS.008.001.08"/>`, `<Document xmlns="` + ns + `pacs.0a8.001.08"/>`,
+		`<Document xmlns="pacs.008.001.08"/>`, `<Document xmlns=""/>`,
+		`<!DOCTYPE Document><Document xmlns="` + ns + `pacs.008.001.08"/>`,
+		`<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><Document xmlns="` + ns + `pacs.008.001.08"/>`,
+		`<a><b></a>`, `<E><AppHdr><x></AppHdr></E>`,
+		`<E><AppHdr/><AppHdr/><Document xmlns="` + ns + `pacs.008.001.08"/></E>`,
+		`<E><AppHdr><Fr></AppHdr></E>`, `<E><AppHdr/></E>`, `<E><AppHdr/><Document/></E>`, `<E`,
+		`<E><Document xmlns="` + ns + `pacs.004.001.09"/><AppHdr/></E>`,
+		`<E><h:AppHdr xmlns:h="` + ns + `head.001.001.02"><h:BizMsgIdr>X</h:BizMsgIdr></h:AppHdr><Document xmlns="` + ns + `pacs.002.001.10"/></E>`,
+		`<?xml version="1.0" encoding="ISO-8859-1"?><Document xmlns="` + ns + `pacs.008.001.08"/>`,
+		`<?xml version="1.0" encoding="utf-8"?><Document xmlns="` + ns + `pacs.008.001.08"/>`,
+		`<Document xmlns="` + ns + `pacs.008.001.08"><unclosed>`,
+		strings.Replace(envelope, "<MsgDefIdr>pacs.008.001.08", "<MsgDefIdr>pacs.002.001.10", 1),
+		strings.Replace(envelope, "<MsgDefIdr>pacs.008.001.08", "<MsgDefIdr>pacs8", 1),
+		strings.Replace(envelope, "<MmbId>99999999</MmbId>", "<MmbId>123</MmbId>", 1),
+		strings.Replace(envelope, "<CreDt>2026-11-21T10:30:01.123Z</CreDt>", "<CreDt>yesterday</CreDt>", 1),
+		strings.Replace(envelope, "<BizMsgIdr>M9999999920261121103000000000001</BizMsgIdr>", "<BizMsgIdr></BizMsgIdr><BizSvc>"+strings.Repeat("s", 36)+"</BizSvc>", 1),
+		strings.Replace(envelope, "<To>", "<To><FIId><FinInstnId><ClrSysMmbId><ClrSysId><Cd>TOOLONG</Cd></ClrSysId><MmbId>1</MmbId></ClrSysMmbId></FinInstnId></FIId>", 1),
+		strings.Replace(envelope, "    <Fr>\n      <FIId>\n        <FinInstnId>\n          <ClrSysMmbId>\n            <MmbId>99999999</MmbId>\n          </ClrSysMmbId>\n        </FinInstnId>\n      </FIId>\n    </Fr>\n", "", 1),
+	}
+	// Truncations after the Document start tag do not affect detection.
+	for _, name := range []string{"pacs008.xml", "envelope_pacs008.xml", "camt054.xml"} {
+		doc := load(name)
+		start := strings.Index(doc, "<Document")
+		end := start + strings.Index(doc[start:], ">") + 1
+		inputs = append(inputs, doc[:end+rng.Intn(len(doc)-end-20)])
+	}
+	var rows [][]string
+	for _, s := range uniq(inputs) {
+		detect := ""
+		if mt, err := iso20022.Detect([]byte(s)); err != nil {
+			detect = "err:" + errKind(err)
+		} else {
+			detect = "ok:" + mt.String()
+		}
+		inspect, vs := "", ""
+		if env, err := iso20022.Inspect([]byte(s)); err != nil {
+			inspect = "err:" + errKind(err)
+		} else {
+			inspect = "ok:" + env.Type.String() + "|" + headerString(env.Header)
+			vs = violations(env.Validate())
+		}
+		rows = append(rows, []string{lit(s), lit(detect), lit(inspect), lit(vs)})
+	}
+	w.table("Detection", "(string Input, string Detect, string Inspect, string Violations)", rows)
+}
+
+// ---------------------------------------------------------------- documents
+
+type validator interface {
+	Validate() error
+	Marshal() ([]byte, error)
+}
+
+var messages = map[string]func([]byte) (validator, error){
+	"pacs.008": func(b []byte) (validator, error) { d, err := pacs008.Parse(b); return d, err },
+	"pacs.002": func(b []byte) (validator, error) { d, err := pacs002.Parse(b); return d, err },
+	"pacs.004": func(b []byte) (validator, error) { d, err := pacs004.Parse(b); return d, err },
+	"camt.054": func(b []byte) (validator, error) { d, err := camt054.Parse(b); return d, err },
+}
+
+func docResult(msg, input string) (string, string) {
+	d, err := messages[msg]([]byte(input))
+	if err != nil {
+		return "err:" + errKind(err), ""
+	}
+	vs := violations(d.Validate())
+	out, err := d.Marshal()
+	if err != nil {
+		return "marshal-err:" + err.Error(), vs
+	}
+	return "ok:" + sha(out), vs
+}
+
+func escape(s string) string {
+	var b bytes.Buffer
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		panic(err)
+	}
+	return b.String()
+}
+
+var textPool = []string{
+	"", " ", "X", "  padded  ", "E99999999202611211030a1B2c3D4e5F", "E123", "D88888888202611211500Zx9Yw8Vu7Ts",
+	"2026-11-21T10:30:00Z", "21/11/2026", "2026-11-21", "2026-11-21T1:30:00,5+24:00", "0", "2", "+1", "1.234", "-1",
+	"150.76", "0.00", "9999999999999999.99", "10000000000000000.00", "BRL", "USD", "CACC", "XXXX", "SHAR", "INDA",
+	"RJCT", "ACSC", "AC03", "ZZ99", "BOOK", "PDNG", "DBIT", "CR", "true", "false", "1", "maybe", "52998224725",
+	"52998224724", "11222333000181", "12ABC34501DE35", "99999999", "1234", "fulano@example.com", "+5521987654321",
+	"not a key", strings.Repeat("M", 36), strings.Repeat("a", 141), strings.Repeat("ã", 106), "quote\"'<&>",
+	"tab\tnl\ncr\r", "ã", "🙂", "\u00a0", "\u2028", "\u0085", "\u200b", "\U000E0001", "\ue000", "\u0378",
+}
+
+var simpleElement = regexp.MustCompile(`<([A-Za-z]+)((?: [^>]*)?)>([^<]*)</([A-Za-z]+)>`)
+var startTag = regexp.MustCompile(`<([A-Za-z]+)[ >]`)
+
+// span returns the end (exclusive) of the element whose start tag begins at
+// start, counting nested elements with the same name.
+func span(doc string, start int, name string) int {
+	depth := 0
+	i := start
+	for i < len(doc) {
+		j := strings.Index(doc[i:], "<")
+		if j < 0 {
+			return -1
+		}
+		i += j
+		switch {
+		case strings.HasPrefix(doc[i:], "</"+name+">"):
+			depth--
+			i += len(name) + 3
+			if depth == 0 {
+				return i
+			}
+		case strings.HasPrefix(doc[i:], "<"+name+">") || strings.HasPrefix(doc[i:], "<"+name+" "):
+			depth++
+			i++
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
+// innerStarts returns the positions of the start tags of every element
+// except the root of the document (and the declaration and comments).
+func innerStarts(doc string) [][]int {
+	all := startTag.FindAllStringSubmatchIndex(doc, -1)
+	if len(all) == 0 {
+		return nil
+	}
+	return all[1:]
+}
+
+func mutateDoc(doc string) string {
+	if len(innerStarts(doc)) == 0 || len(simpleElement.FindAllStringIndex(doc, -1)) == 0 {
+		return doc + " "
+	}
+	switch rng.Intn(14) {
+	case 0, 1, 2, 3: // replace the text of a simple element
+		m := simpleElement.FindAllStringSubmatchIndex(doc, -1)
+		var ok [][]int
+		for _, x := range m {
+			if doc[x[2]:x[3]] == doc[x[8]:x[9]] {
+				ok = append(ok, x)
+			}
+		}
+		if len(ok) == 0 {
+			return doc + " "
+		}
+		x := ok[rng.Intn(len(ok))]
+		return doc[:x[6]] + escape(textPool[rng.Intn(len(textPool))]) + doc[x[7]:]
+	case 4: // delete an element
+		s := innerStarts(doc)
+		x := s[rng.Intn(len(s))]
+		end := span(doc, x[0], doc[x[2]:x[3]])
+		return doc[:x[0]] + doc[end:]
+	case 5: // duplicate an element
+		s := innerStarts(doc)
+		x := s[rng.Intn(len(s))]
+		end := span(doc, x[0], doc[x[2]:x[3]])
+		return doc[:end] + doc[x[0]:end] + doc[end:]
+	case 6: // insert an unknown element, possibly with nested content
+		s := innerStarts(doc)
+		x := s[rng.Intn(len(s))]
+		extra := []string{"<Xtra>ignored</Xtra>", "<Xtra a=\"1\"><MsgId>inner</MsgId></Xtra>", "<Xtra/>"}
+		return doc[:x[0]] + extra[rng.Intn(len(extra))] + doc[x[0]:]
+	case 7: // rename an element
+		s := innerStarts(doc)
+		x := s[rng.Intn(len(s))]
+		name := doc[x[2]:x[3]]
+		end := span(doc, x[0], name)
+		inner := doc[x[0]+1+len(name) : end-len(name)-3]
+		return doc[:x[0]] + "<" + name + "Q" + inner + "</" + name + "Q>" + doc[end:]
+	case 8: // change a Ccy attribute, or add an attribute
+		re := regexp.MustCompile(`Ccy="[^"]*"`)
+		if m := re.FindAllStringIndex(doc, -1); len(m) > 0 {
+			x := m[rng.Intn(len(m))]
+			vals := []string{"USD", "", "brl", "BRL", " BRL", "B\tRL"}
+			return doc[:x[0]] + `Ccy="` + escape(vals[rng.Intn(len(vals))]) + `"` + doc[x[1]:]
+		}
+		return strings.Replace(doc, "<MsgId>", `<MsgId foo="bar">`, 1)
+	case 9: // change, remove or prefix the Document namespace
+		re := regexp.MustCompile(`<Document xmlns="([^"]*)">`)
+		x := re.FindStringSubmatchIndex(doc)
+		if x == nil {
+			return doc + "\n"
+		}
+		cur := doc[x[2]:x[3]]
+		switch rng.Intn(4) {
+		case 0:
+			pool := []string{"urn:x", "urn:iso:std:iso:20022:tech:xsd:pacs.008.001.10", "urn:iso:std:iso:20022:tech:xsd:pacs.002.001.12",
+				"urn:iso:std:iso:20022:tech:xsd:camt.054.001.02", "urn:iso:std:iso:20022:tech:xsd:pacs.004.001.11", "urn:iso:std:iso:20022:tech:xsd:head.001.001.01"}
+			return doc[:x[2]] + pool[rng.Intn(len(pool))] + doc[x[3]:]
+		case 1:
+			return doc[:x[0]] + "<Document>" + doc[x[1]:]
+		case 2:
+			out := doc[:x[0]] + `<p:Document xmlns:p="` + cur + `">` + doc[x[1]:]
+			return strings.Replace(out, "</Document>", "</p:Document>", 1)
+		default:
+			return doc[:x[0]] + `<Document xmlns="` + cur + `" xmlns:o="urn:other" o:attr="1">` + doc[x[1]:]
+		}
+	case 10: // comment, CDATA or a character reference inside a text element
+		m := simpleElement.FindAllStringSubmatchIndex(doc, -1)
+		x := m[rng.Intn(len(m))]
+		text := doc[x[6]:x[7]]
+		cut := 0
+		if len(text) > 0 {
+			cut = rng.Intn(len(text) + 1)
+			for cut < len(text) && !utf8.RuneStart(text[cut]) {
+				cut++
+			}
+		}
+		inserts := []string{"<!-- c -->", "<![CDATA[<&>]]>", "&#x41;", "&amp;", "<?pi x?>", "<b>nested</b>"}
+		return doc[:x[6]] + text[:cut] + inserts[rng.Intn(len(inserts))] + text[cut:] + doc[x[7]:]
+	case 11: // truncate inside the Document
+		start := strings.Index(doc, "<Document")
+		if start < 0 {
+			start = strings.Index(doc, "<p:Document")
+		}
+		if start < 0 || len(doc)-start < 2 {
+			return doc + "<"
+		}
+		return doc[:start+rng.Intn(len(doc)-start-1)+1]
+	case 12: // mismatched end tag
+		s := innerStarts(doc)
+		x := s[rng.Intn(len(s))]
+		name := doc[x[2]:x[3]]
+		end := span(doc, x[0], name)
+		return doc[:end-len(name)-3] + "</" + name + "x>" + doc[end:]
+	default: // repeat a child element in place (merging semantics)
+		names := []string{"GrpHdr", "IntrBkSttlmAmt", "Dbtr", "PmtTpInf", "Tp", "Sts", "BkTxCd", "TxInfAndSts", "Ntry", "Ustrd", "MsgId", "Id"}
+		name := names[rng.Intn(len(names))]
+		i := strings.Index(doc, "<"+name+">")
+		if i < 0 {
+			i = strings.Index(doc, "<"+name+" ")
+		}
+		if i < 0 {
+			return doc
+		}
+		end := span(doc, i, name)
+		alt := simpleElement.ReplaceAllStringFunc(doc[i:end], func(m string) string {
+			if rng.Intn(3) != 0 {
+				return m
+			}
+			sub := simpleElement.FindStringSubmatch(m)
+			if sub[1] != sub[4] {
+				return m
+			}
+			return "<" + sub[1] + sub[2] + ">" + escape(textPool[rng.Intn(len(textPool))]) + "</" + sub[1] + ">"
+		})
+		return doc[:end] + alt + doc[end:]
+	}
+}
+
+func genDocuments(w *writer) {
+	goldens := []struct{ file, msg string }{
+		{"pacs008.xml", "pacs.008"}, {"envelope_pacs008.xml", "pacs.008"}, {"pacs002_accept.xml", "pacs.002"},
+		{"pacs002_reject.xml", "pacs.002"}, {"pacs004.xml", "pacs.004"}, {"camt054.xml", "camt.054"},
+	}
+	var rows [][]string
+	add := func(msg, input string) {
+		res, vs := docResult(msg, input)
+		rows = append(rows, []string{lit(msg), lit(input), lit(res), lit(vs)})
+	}
+	for _, g := range goldens {
+		doc := load(g.file)
+		add(g.msg, doc)
+		// Parsing as another message must fail with UnexpectedMessage.
+		other := map[string]string{"pacs.008": "pacs.002", "pacs.002": "pacs.004", "pacs.004": "camt.054", "camt.054": "pacs.008"}[g.msg]
+		add(other, doc)
+		seen := map[string]bool{doc: true}
+		for n := 0; n < 22; {
+			m := mutateDoc(doc)
+			if rng.Intn(3) == 0 {
+				m = mutateDoc(m)
+			}
+			if seen[m] || !utf8.ValidString(m) {
+				continue
+			}
+			seen[m] = true
+			add(g.msg, m)
+			n++
+		}
+	}
+	// Two Documents inside an envelope.
+	env := load("envelope_pacs008.xml")
+	start := strings.Index(env, "  <Document")
+	end := strings.Index(env, "</Document>") + len("</Document>\n")
+	add("pacs.008", env[:end]+env[start:])
+	w.table("Documents", "(string Message, string Input, string Result, string Violations)", rows)
+}
+
+// ---------------------------------------------------------------- model mutations
+
+var modelStrings = []string{
+	"", " ", "X", "E99999999202611211030a1B2c3D4e5F", "E9999999920261121103000000000001", "D88888888202611211500Zx9Yw8Vu7Ts",
+	"E123", strings.Repeat("M", 35), strings.Repeat("M", 36), strings.Repeat("a", 141), strings.Repeat("ã", 140),
+	"2026-11-21T10:30:00Z", "2026-11-21", "21/11/2026", "2026-02-30T00:00:00Z", "0000-01-01T00:00:00Z",
+	"2026-11-21T1:30:00Z", "2026-11-21T10:30:00,5Z", "2026-11-21T10:30:00+24:00", "2026-11-21T10:30:00+25:00",
+	"BRL", "USD", "CACC", "SVGS", "XXXX", "TOOLONG", "SLEV", "CLRG", "RJCT", "ACSC", "BOOK", "CRDT", "DBIT",
+	"52998224725", "52998224724", "11222333000181", "12ABC34501DE35", "99999999", "1234", "fulano@example.com",
+	"+5521987654321", "123e4567-e89b-12d3-a456-426614174000", "not a key", "pacs.008.001.08", "pacs8", "pacs.002.001.10",
+	"a\x00b", "\x01", "tab\there", "quote\"'<&>", "ã", "🙂", "\u00a0", "\u2028", "\u0085", "\x7f", "\ufffe", "１２３",
+	"\u200b", "\U000E0001", "\ue000", "\u0378", "\ufffd", "\u00ad", "line\nbreak", "cr\rlf",
+}
+
+var modelCents = []int64{0, 1, -1, 5000, 15075, 15076, 999999999999999999, 1000000000000000000, math.MaxInt64, math.MinInt64}
+
+type field struct {
+	name  string
+	cents bool
+	set   func(doc any, v string, c int64)
+}
+
+func p8(d any) *pacs008.CreditTransferTransaction {
+	return &d.(*pacs008.Document).FIToFICstmrCdtTrf.CdtTrfTxInf[0]
+}
+
+func p2(d any) *pacs002.TransactionStatus {
+	return &d.(*pacs002.Document).FIToFIPmtStsRpt.TxInfAndSts[0]
+}
+
+func p4(d any) *pacs004.ReturnTransaction { return &d.(*pacs004.Document).PmtRtr.TxInf[0] }
+
+func c54(d any, i int) *camt054.Entry {
+	return &d.(*camt054.Document).BkToCstmrDbtCdtNtfctn.Ntfctn[0].Ntry[i]
+}
+
+var modelFields = map[string][]field{
+	"pacs.008": {
+		{"Namespace", false, func(d any, v string, _ int64) { d.(*pacs008.Document).XMLName.Space = v }},
+		{"MsgId", false, func(d any, v string, _ int64) { d.(*pacs008.Document).FIToFICstmrCdtTrf.GrpHdr.MsgId = v }},
+		{"CreDtTm", false, func(d any, v string, _ int64) {
+			d.(*pacs008.Document).FIToFICstmrCdtTrf.GrpHdr.CreDtTm = xsd.DateTime(v)
+		}},
+		{"NbOfTxs", false, func(d any, v string, _ int64) { d.(*pacs008.Document).FIToFICstmrCdtTrf.GrpHdr.NbOfTxs = v }},
+		{"SttlmMtd", false, func(d any, v string, _ int64) { d.(*pacs008.Document).FIToFICstmrCdtTrf.GrpHdr.SttlmInf.SttlmMtd = v }},
+		{"EndToEndId", false, func(d any, v string, _ int64) { p8(d).PmtId.EndToEndId = v }},
+		{"TxId", false, func(d any, v string, _ int64) { p8(d).PmtId.TxId = v }},
+		{"InstrPrty", false, func(d any, v string, _ int64) { p8(d).PmtTpInf.InstrPrty = v }},
+		{"LclInstrm.Cd", false, func(d any, v string, _ int64) { p8(d).PmtTpInf.LclInstrm.Cd = v }},
+		{"LclInstrm.Prtry", false, func(d any, v string, _ int64) { p8(d).PmtTpInf.LclInstrm.Prtry = v }},
+		{"Amount.Ccy", false, func(d any, v string, _ int64) { p8(d).IntrBkSttlmAmt.Ccy = v }},
+		{"Amount.Cents", true, func(d any, _ string, c int64) { p8(d).IntrBkSttlmAmt.Value = money.Amount(c) }},
+		{"AccptncDtTm", false, func(d any, v string, _ int64) { p8(d).AccptncDtTm = xsd.DateTime(v) }},
+		{"ChrgBr", false, func(d any, v string, _ int64) { p8(d).ChrgBr = v }},
+		{"Dbtr.Nm", false, func(d any, v string, _ int64) { p8(d).Dbtr.Nm = v }},
+		{"Dbtr.TaxId", false, func(d any, v string, _ int64) { p8(d).Dbtr.Id.PrvtId.Othr[0].Id = v }},
+		{"Cdtr.Nm", false, func(d any, v string, _ int64) { p8(d).Cdtr.Nm = v }},
+		{"Cdtr.TaxId", false, func(d any, v string, _ int64) { p8(d).Cdtr.Id.OrgId.Othr[0].Id = v }},
+		{"DbtrAcct.Number", false, func(d any, v string, _ int64) { p8(d).DbtrAcct.Id.Othr.Id = v }},
+		{"DbtrAcct.Branch", false, func(d any, v string, _ int64) { p8(d).DbtrAcct.Id.Othr.Issr = v }},
+		{"DbtrAcct.Tp", false, func(d any, v string, _ int64) { p8(d).DbtrAcct.Tp = xsd.Proprietary(v) }},
+		{"DbtrAcct.Ccy", false, func(d any, v string, _ int64) { p8(d).DbtrAcct.Ccy = v }},
+		{"DbtrAcct.IBAN", false, func(d any, v string, _ int64) { p8(d).DbtrAcct.Id.IBAN = v }},
+		{"CdtrAcct.Nm", false, func(d any, v string, _ int64) { p8(d).CdtrAcct.Nm = v }},
+		{"CdtrAcct.PixKey", false, func(d any, v string, _ int64) { p8(d).CdtrAcct.Prxy.Id = v }},
+		{"DbtrAgt.Ispb", false, func(d any, v string, _ int64) { p8(d).DbtrAgt.FinInstnId.ClrSysMmbId.MmbId = v }},
+		{"CdtrAgt.Ispb", false, func(d any, v string, _ int64) { p8(d).CdtrAgt.FinInstnId.ClrSysMmbId.MmbId = v }},
+		{"Purp", false, func(d any, v string, _ int64) { p8(d).Purp = xsd.Code(v) }},
+		{"Ustrd", false, func(d any, v string, _ int64) { p8(d).RmtInf.Ustrd[0] = v }},
+	},
+	"pacs.002": {
+		{"MsgId", false, func(d any, v string, _ int64) { d.(*pacs002.Document).FIToFIPmtStsRpt.GrpHdr.MsgId = v }},
+		{"OrgnlMsgNmId", false, func(d any, v string, _ int64) {
+			d.(*pacs002.Document).FIToFIPmtStsRpt.OrgnlGrpInfAndSts[0].OrgnlMsgNmId = v
+		}},
+		{"GrpSts", false, func(d any, v string, _ int64) { d.(*pacs002.Document).FIToFIPmtStsRpt.OrgnlGrpInfAndSts[0].GrpSts = v }},
+		{"OrgnlEndToEndId", false, func(d any, v string, _ int64) { p2(d).OrgnlEndToEndId = v }},
+		{"TxSts", false, func(d any, v string, _ int64) { p2(d).TxSts = v }},
+		{"Rsn", false, func(d any, v string, _ int64) { p2(d).StsRsnInf[0].Rsn.Cd = v }},
+		{"AddtlInf", false, func(d any, v string, _ int64) { p2(d).StsRsnInf[0].AddtlInf[0] = v }},
+		{"FctvDt", false, func(d any, v string, _ int64) { p2(d).FctvIntrBkSttlmDt = &xsd.DateAndDateTime{Dt: xsd.Date(v)} }},
+		{"FctvDtTm", false, func(d any, v string, _ int64) { p2(d).FctvIntrBkSttlmDt = &xsd.DateAndDateTime{DtTm: xsd.DateTime(v)} }},
+	},
+	"pacs.004": {
+		{"RtrId", false, func(d any, v string, _ int64) { p4(d).RtrId = v }},
+		{"OrgnlEndToEndId", false, func(d any, v string, _ int64) { p4(d).OrgnlEndToEndId = v }},
+		{"OrgnlMsgId", false, func(d any, v string, _ int64) { p4(d).OrgnlGrpInf.OrgnlMsgId = v }},
+		{"Rtrd.Cents", true, func(d any, _ string, c int64) { p4(d).RtrdIntrBkSttlmAmt.Value = money.Amount(c) }},
+		{"Orgnl.Cents", true, func(d any, _ string, c int64) {
+			a := xsd.BRL(money.Amount(c))
+			p4(d).OrgnlIntrBkSttlmAmt = &a
+		}},
+		{"ChrgBr", false, func(d any, v string, _ int64) { p4(d).ChrgBr = v }},
+		{"Rsn", false, func(d any, v string, _ int64) { p4(d).RtrRsnInf[0].Rsn.Cd = v }},
+		{"AddtlInf", false, func(d any, v string, _ int64) { p4(d).RtrRsnInf[0].AddtlInf[0] = v }},
+		{"NbOfTxs", false, func(d any, v string, _ int64) { d.(*pacs004.Document).PmtRtr.GrpHdr.NbOfTxs = v }},
+	},
+	"camt.054": {
+		{"Ntfctn.Id", false, func(d any, v string, _ int64) { d.(*camt054.Document).BkToCstmrDbtCdtNtfctn.Ntfctn[0].Id = v }},
+		{"Acct.Number", false, func(d any, v string, _ int64) {
+			d.(*camt054.Document).BkToCstmrDbtCdtNtfctn.Ntfctn[0].Acct.Id.Othr.Id = v
+		}},
+		{"Ntry.Amt.Cents", true, func(d any, _ string, c int64) { c54(d, 0).Amt.Value = money.Amount(c) }},
+		{"Tx.Amt.Cents", true, func(d any, _ string, c int64) { c54(d, 0).NtryDtls[0].TxDtls[0].Amt.Value = money.Amount(c) }},
+		{"CdtDbtInd", false, func(d any, v string, _ int64) { c54(d, 0).CdtDbtInd = v }},
+		{"Sts.Cd", false, func(d any, v string, _ int64) { c54(d, 0).Sts.Cd = v }},
+		{"Refs.EndToEndId", false, func(d any, v string, _ int64) { c54(d, 0).NtryDtls[0].TxDtls[0].Refs.EndToEndId = v }},
+		{"AddtlTxInf", false, func(d any, v string, _ int64) { c54(d, 1).NtryDtls[0].TxDtls[0].AddtlTxInf = v }},
+		{"BookgDt.Dt", false, func(d any, v string, _ int64) { c54(d, 0).BookgDt = &xsd.DateAndDateTime{Dt: xsd.Date(v)} }},
+		{"Domn.Cd", false, func(d any, v string, _ int64) { c54(d, 0).BkTxCd.Domn.Cd = v }},
+	},
+	"head.001": {
+		{"Fr.Ispb", false, func(d any, v string, _ int64) { d.(*iso20022.Envelope).Header.Fr.FIId.FinInstnId.ClrSysMmbId.MmbId = v }},
+		{"MsgDefIdr", false, func(d any, v string, _ int64) { d.(*iso20022.Envelope).Header.MsgDefIdr = v }},
+		{"BizMsgIdr", false, func(d any, v string, _ int64) { d.(*iso20022.Envelope).Header.BizMsgIdr = v }},
+		{"BizSvc", false, func(d any, v string, _ int64) { d.(*iso20022.Envelope).Header.BizSvc = v }},
+		{"CreDt", false, func(d any, v string, _ int64) { d.(*iso20022.Envelope).Header.CreDt = xsd.DateTime(v) }},
+	},
+}
+
+func freshModel(msg string) any {
+	var (
+		d   any
+		err error
+	)
+	switch msg {
+	case "pacs.008":
+		d, err = pacs008.Parse([]byte(load("pacs008.xml")))
+	case "pacs.002":
+		d, err = pacs002.Parse([]byte(load("pacs002_reject.xml")))
+	case "pacs.004":
+		d, err = pacs004.Parse([]byte(load("pacs004.xml")))
+	case "camt.054":
+		d, err = camt054.Parse([]byte(load("camt054.xml")))
+	default:
+		var env iso20022.Envelope
+		env, err = iso20022.Inspect([]byte(load("envelope_pacs008.xml")))
+		d = &env
+	}
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+func genModels(w *writer) {
+	var rows [][]string
+	for _, msg := range []string{"pacs.008", "pacs.002", "pacs.004", "camt.054", "head.001"} {
+		for _, f := range modelFields[msg] {
+			var values []string
+			if f.cents {
+				for _, c := range modelCents {
+					values = append(values, strconv.FormatInt(c, 10))
+				}
+			} else {
+				values = append(values, "")
+				for i := 0; i < 6; i++ {
+					values = append(values, modelStrings[rng.Intn(len(modelStrings))])
+				}
+				values = uniq(values)
+			}
+			for _, v := range values {
+				d := freshModel(msg)
+				c, _ := strconv.ParseInt(v, 10, 64)
+				f.set(d, v, c)
+				var vs, out string
+				var marshalled []byte
+				var err error
+				if env, ok := d.(*iso20022.Envelope); ok {
+					vs = violations(env.Validate())
+					marshalled, err = env.Header.Marshal()
+				} else {
+					vs = violations(d.(validator).Validate())
+					marshalled, err = d.(validator).Marshal()
+				}
+				if err != nil {
+					out = "err:" + err.Error()
+				} else {
+					out = sha(marshalled)
+				}
+				rows = append(rows, []string{lit(msg), lit(f.name), lit(v), lit(vs), lit(out)})
+			}
+		}
+	}
+	w.table("Models", "(string Message, string Field, string Value, string Violations, string Xml)", rows)
+}
+
+// ---------------------------------------------------------------- builders
+
+func sampleTransfer() pacs008.Transfer {
+	return pacs008.Transfer{
+		Amount:          money.MustParse("10.00"),
+		AcceptedAt:      time.Date(2026, 11, 21, 10, 30, 0, 0, time.UTC),
+		Initiation:      pacs008.InitiationManual,
+		Debtor:          pacs008.Party{Name: "Fulano de Tal", TaxID: "52998224725"},
+		DebtorAccount:   pacs008.Account{ISPB: "99999999", Branch: "0001", Number: "123456", Type: xsd.AccountCurrent},
+		Creditor:        pacs008.Party{Name: "Loja Exemplo Ltda", TaxID: "11222333000181"},
+		CreditorAccount: pacs008.Account{ISPB: "88888888", Number: "000123", Type: xsd.AccountPayments},
+		PixKey:          "+5521987654321",
+		Purpose:         "IPAY",
+		RemittanceInfo:  "obrigado",
+	}
+}
+
+func builderResult(xmlOut func() ([]byte, error), err error) string {
+	var vs xsd.Violations
+	switch {
+	case err == nil:
+		b, merr := xmlOut()
+		if merr != nil {
+			return "marshal-err:" + merr.Error()
+		}
+		return "xml:" + sha(b)
+	case errors.As(err, &vs):
+		b, merr := xmlOut()
+		if merr != nil {
+			return "invalid:marshal-err|" + violations(err)
+		}
+		return "invalid:" + sha(b) + "|" + violations(err)
+	default:
+		return "err:" + err.Error()
+	}
+}
+
+func genBuilders(w *writer) {
+	created := time.Date(2026, 11, 21, 10, 30, 1, 0, time.UTC)
+	orig := func() *pacs008.Document {
+		d, err := pacs008.Parse([]byte(load("pacs008.xml")))
+		if err != nil {
+			panic(err)
+		}
+		return d
+	}
+	at2 := time.Date(2026, 11, 21, 10, 30, 1, 456e6, time.UTC)
+	at4 := time.Date(2026, 11, 21, 15, 0, 0, 0, time.UTC)
+	rd := func(seed, n int) *bytes.Reader { return bytes.NewReader(pattern(seed, n)) }
+
+	p8 := func(f func() (*pacs008.Document, error)) string {
+		d, err := f()
+		return builderResult(func() ([]byte, error) { return d.Marshal() }, err)
+	}
+	p2r := func(f func() (*pacs002.Document, error)) string {
+		d, err := f()
+		return builderResult(func() ([]byte, error) { return d.Marshal() }, err)
+	}
+	p4r := func(f func() (*pacs004.Document, error)) string {
+		d, err := f()
+		return builderResult(func() ([]byte, error) { return d.Marshal() }, err)
+	}
+
+	type scenario struct {
+		name string
+		run  func() string
+	}
+	scenarios := []scenario{
+		{"p008.generated", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				return pacs008.NewBuilder(created).Rand(rd(37, 256)).Add(sampleTransfer()).Build()
+			})
+		}},
+		{"p008.two", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				second := sampleTransfer()
+				second.Amount = money.MustParse("0.01")
+				second.Creditor = pacs008.Party{Name: "Beltrano", TaxID: "11144477735"}
+				second.Initiation = ""
+				second.Priority = "HIGH"
+				second.TxID = "qr-txid-42"
+				second.AcceptedAt = time.Time{}
+				return pacs008.NewBuilder(created).Rand(rd(13, 512)).Add(sampleTransfer()).Add(second).Build()
+			})
+		}},
+		{"p008.explicit", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				tr := sampleTransfer()
+				tr.EndToEndID = "E99999999202611211030a1B2c3D4e5F"
+				tr.AcceptedAt = time.Time{}
+				tr.Priority = "HIGH"
+				tr.Initiation = ""
+				return pacs008.NewBuilder(created).MsgID("M9999999920261121103000000000001").Add(tr).Build()
+			})
+		}},
+		{"p008.golden", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				return pacs008.NewBuilder(time.Date(2026, 11, 21, 10, 30, 1, 123e6, time.UTC)).
+					MsgID("M9999999920261121103000000000001").
+					Add(pacs008.Transfer{
+						EndToEndID:      "E99999999202611211030a1B2c3D4e5F",
+						Amount:          money.MustParse("150.75"),
+						AcceptedAt:      time.Date(2026, 11, 21, 10, 30, 0, 0, time.UTC),
+						Initiation:      pacs008.InitiationDICT,
+						Debtor:          pacs008.Party{Name: "Fulano de Tal", TaxID: "52998224725"},
+						DebtorAccount:   pacs008.Account{ISPB: "99999999", Branch: "0001", Number: "123456", Type: xsd.AccountCurrent},
+						Creditor:        pacs008.Party{Name: "Loja Exemplo Ltda", TaxID: "11222333000181"},
+						CreditorAccount: pacs008.Account{ISPB: "88888888", Branch: "0001", Number: "6543210", Type: xsd.AccountCurrent},
+						PixKey:          "pagamentos@example.com",
+						RemittanceInfo:  "Pedido 4521",
+					}).Build()
+			})
+		}},
+		{"p008.invalid", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				tr := sampleTransfer()
+				tr.Amount = 0
+				tr.Debtor.TaxID = "52998224724"
+				tr.CreditorAccount.ISPB = "1234"
+				tr.PixKey = "not a key"
+				return pacs008.NewBuilder(created).Rand(rd(5, 256)).Add(tr).Build()
+			})
+		}},
+		{"p008.noispb", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				tr := sampleTransfer()
+				tr.DebtorAccount.ISPB = ""
+				return pacs008.NewBuilder(created).Add(tr).Build()
+			})
+		}},
+		{"p008.empty", func() string {
+			return p8(func() (*pacs008.Document, error) { return pacs008.NewBuilder(created).Build() })
+		}},
+		{"p008.exhausted", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				return pacs008.NewBuilder(created).Rand(bytes.NewReader(bytes.Repeat([]byte{255}, 4096))).Add(sampleTransfer()).Build()
+			})
+		}},
+		{"p008.eof", func() string {
+			return p8(func() (*pacs008.Document, error) {
+				return pacs008.NewBuilder(created).MsgID("m").Rand(bytes.NewReader(nil)).Add(sampleTransfer()).Build()
+			})
+		}},
+		{"p002.accept.golden", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Accept(orig(), pacs002.At(at2), pacs002.SettledAt(at2.Add(333*time.Millisecond)), pacs002.WithMsgID("M8888888820261121103000000000007"))
+			})
+		}},
+		{"p002.reject.golden", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Reject(orig(), "AC03", pacs002.At(at2), pacs002.WithMsgID("M8888888820261121103000000000008"),
+					pacs002.WithAdditionalInfo("Conta do recebedor inexistente"))
+			})
+		}},
+		{"p002.reject.generated", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Reject(orig(), "AM04", pacs002.At(at2), pacs002.WithRand(rd(11, 128)))
+			})
+		}},
+		{"p002.accept.ispb", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Accept(orig(), pacs002.At(at2), pacs002.WithISPB("77777777"), pacs002.WithRand(rd(3, 128)))
+			})
+		}},
+		{"p002.unknown", func() string {
+			return p2r(func() (*pacs002.Document, error) { return pacs002.Reject(orig(), "ZZ99", pacs002.At(at2)) })
+		}},
+		{"p002.allowunknown", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Reject(orig(), "ZZ99", pacs002.AllowUnknownReason(), pacs002.At(at2), pacs002.WithRand(bytes.NewReader(make([]byte, 64))))
+			})
+		}},
+		{"p002.empty_reason", func() string {
+			return p2r(func() (*pacs002.Document, error) { return pacs002.Reject(orig(), "", pacs002.At(at2)) })
+		}},
+		{"p002.toolong", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Reject(orig(), "TOOLONG", pacs002.AllowUnknownReason(), pacs002.At(at2), pacs002.WithMsgID("m"))
+			})
+		}},
+		{"p002.no_original", func() string {
+			return p2r(func() (*pacs002.Document, error) { return pacs002.Accept(&pacs008.Document{}, pacs002.At(at2)) })
+		}},
+		{"p002.bad_ispb", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Accept(orig(), pacs002.WithISPB("x"), pacs002.At(at2))
+			})
+		}},
+		{"p002.long_info", func() string {
+			return p2r(func() (*pacs002.Document, error) {
+				return pacs002.Reject(orig(), "AC03", pacs002.At(at2), pacs002.WithMsgID("m"), pacs002.WithAdditionalInfo(strings.Repeat("x", 106)))
+			})
+		}},
+		{"p004.golden", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonCustomerRefund, money.MustParse("50.00"), pacs004.At(at4),
+					pacs004.WithMsgID("M8888888820261121150000000000003"), pacs004.WithReturnID("D88888888202611211500Zx9Yw8Vu7Ts"),
+					pacs004.WithAdditionalInfo("Devolucao parcial a pedido do recebedor"))
+			})
+		}},
+		{"p004.generated", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonFraud, money.MustParse("150.75"), pacs004.At(at4), pacs004.WithRand(rd(29, 256)))
+			})
+		}},
+		{"p004.over", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, money.MustParse("150.76"), pacs004.At(at4))
+			})
+		}},
+		{"p004.prior", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, money.MustParse("100.75"), pacs004.At(at4),
+					pacs004.WithPriorReturns(money.MustParse("50")), pacs004.WithRand(rd(7, 256)))
+			})
+		}},
+		{"p004.prior_over", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, money.MustParse("100.76"), pacs004.At(at4),
+					pacs004.WithPriorReturns(money.MustParse("50")))
+			})
+		}},
+		{"p004.prior_above", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, money.MustParse("0.01"), pacs004.At(at4),
+					pacs004.WithPriorReturns(money.MustParse("200")))
+			})
+		}},
+		{"p004.negative_prior", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, money.MustParse("0.01"), pacs004.At(at4),
+					pacs004.WithPriorReturns(money.Amount(math.MinInt64+1)))
+			})
+		}},
+		{"p004.zero", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, 0, pacs004.At(at4))
+			})
+		}},
+		{"p004.unknown", func() string {
+			return p4r(func() (*pacs004.Document, error) { return pacs004.FromPacs008(orig(), "XX01", 1, pacs004.At(at4)) })
+		}},
+		{"p004.allowunknown", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), "XX01", 1, pacs004.AllowUnknownReason(), pacs004.At(at4), pacs004.WithRand(rd(17, 256)))
+			})
+		}},
+		{"p004.e2e_missing", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, 1, pacs004.ForEndToEndID("nope"), pacs004.At(at4))
+			})
+		}},
+		{"p004.e2e", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, 1, pacs004.ForEndToEndID("E99999999202611211030a1B2c3D4e5F"),
+					pacs004.At(at4), pacs004.WithRand(rd(19, 256)))
+			})
+		}},
+		{"p004.nil", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(nil, pacs004.ReasonBankError, 1, pacs004.At(at4))
+			})
+		}},
+		{"p004.empty", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(&pacs008.Document{}, pacs004.ReasonBankError, 1, pacs004.At(at4))
+			})
+		}},
+		{"p004.bad_ispb", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				d := orig()
+				d.FIToFICstmrCdtTrf.CdtTrfTxInf[0].CdtrAgt = xsd.AgentISPB("x")
+				return pacs004.FromPacs008(d, pacs004.ReasonBankError, 1, pacs004.At(at4))
+			})
+		}},
+		{"p004.bad_ispb_rtr", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				d := orig()
+				d.FIToFICstmrCdtTrf.CdtTrfTxInf[0].CdtrAgt = xsd.AgentISPB("x")
+				return pacs004.FromPacs008(d, pacs004.ReasonBankError, 1, pacs004.At(at4), pacs004.WithMsgID("m"))
+			})
+		}},
+		{"p004.long_info", func() string {
+			return p4r(func() (*pacs004.Document, error) {
+				return pacs004.FromPacs008(orig(), pacs004.ReasonBankError, 1, pacs004.At(at4), pacs004.WithMsgID("m"),
+					pacs004.WithReturnID("D88888888202611211500Zx9Yw8Vu7Ts"), pacs004.WithAdditionalInfo(strings.Repeat("x", 106)))
+			})
+		}},
+	}
+	var rows [][]string
+	for _, s := range scenarios {
+		rows = append(rows, []string{lit(s.name), lit(s.run())})
+	}
+	w.table("Builders", "(string Name, string Result)", rows)
+}

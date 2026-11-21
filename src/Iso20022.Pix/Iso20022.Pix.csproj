@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Iso20022.Pix</RootNamespace>
+    <AssemblyName>Iso20022.Pix</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+
+  <PropertyGroup Label="NuGet">
+    <PackageId>Iso20022.Pix</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Victor Condack</Authors>
+    <Description>Typed, validated ISO 20022 messages for Brazil's instant payment system Pix (SPI): pacs.008, pacs.002, pacs.004, camt.054 and the head.001 AppHdr. Strict validation that reports every violation with an XPath-like location, exact BRL amounts in centavos, EndToEndId/RtrId/MsgId helpers, XXE-safe streaming message detection and accept/reject/return builders. Parity-tested against the Go implementation.</Description>
+    <PackageTags>iso20022;pix;spi;pacs.008;pacs.002;pacs.004;camt.054;brazil;payments</PackageTags>
+    <RepositoryUrl>https://github.com/victorcondackdev/iso20022-pix-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/victorcondackdev/iso20022-pix-dotnet</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (c) 2026 Victor Condack</Copyright>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Iso20022.Pix.Tests" />
+  </ItemGroup>
+
+</Project>
