@@ -19,7 +19,7 @@ jobs:
     name: Build, test and pack
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -70,7 +70,7 @@ jobs:
     name: Trimming smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -100,11 +100,11 @@ jobs:
     # Requires the Go implementation to be reachable; informative until it is public.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: iso20022-pix-dotnet
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: victorcondackdev/iso20022-pix-go
           path: iso20022-pix-go
